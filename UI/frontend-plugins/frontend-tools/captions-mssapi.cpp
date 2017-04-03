@@ -1,16 +1,4 @@
-#include <obs.hpp>
-#include <obs-frontend-api.h>
-#include <util/threading.h>
-
-#include <string>
-
 #include "captions-mssapi.hpp"
-#include "captions-mssapi-stream.hpp"
-#include <util/windows/HRError.hpp>
-#include <util/windows/ComPtr.hpp>
-#include <util/windows/CoTaskMemPtr.hpp>
-#include <util/platform.h>
-#include <sphelper.h>
 
 #define do_log(type, format, ...) blog(type, "[Captions] " format, \
 		##__VA_ARGS__)
@@ -18,44 +6,27 @@
 #define error(format, ...) do_log(LOG_ERROR, format, ##__VA_ARGS__)
 #define debug(format, ...) do_log(LOG_DEBUG, format, ##__VA_ARGS__)
 
-void mssapi_thread(OBSWeakSource source, HANDLE stop_event,
-		std::string lang_name)
-try {
-	ComPtr<CaptionStream>  audio;
-	ComPtr<ISpObjectToken> token;
-	ComPtr<ISpRecoGrammar> grammar;
-	ComPtr<ISpRecognizer>  recognizer;
-	ComPtr<ISpRecoContext> context;
+mssapi_captions::mssapi_captions(
+		captions_cb callback,
+		const std::string &lang) try
+	: captions_handler(callback, AUDIO_FORMAT_16BIT, 16000)
+{
 	HRESULT hr;
 
-	auto cb = [&] (const struct audio_data *audio_data,
-			bool muted)
-	{
-		audio->PushAudio(audio_data, muted);
-	};
+	std::wstring wlang;
+	wlang.resize(lang.size());
 
-	using cb_t = decltype(cb);
+	for (size_t i = 0; i < lang.size(); i++)
+		wlang[i] = (wchar_t)lang[i];
 
-	auto pre_cb = [] (void *param, obs_source_t*,
-		const struct audio_data *audio_data, bool muted)
-	{
-		return (*static_cast<cb_t*>(param))(audio_data, muted);
-	};
-
-	os_set_thread_name(__FUNCTION__);
-
-	CoInitialize(nullptr);
-
-	std::wstring wlang_name;
-	wlang_name.resize(lang_name.size());
-
-	for (size_t i = 0; i < lang_name.size(); i++)
-		wlang_name[i] = (wchar_t)lang_name[i];
-
-	LCID lang_id = LocaleNameToLCID(wlang_name.c_str(), 0);
+	LCID lang_id = LocaleNameToLCID(wlang.c_str(), 0);
 
 	wchar_t lang_str[32];
 	_snwprintf(lang_str, 31, L"language=%x", (int)lang_id);
+
+	stop = CreateEvent(nullptr, false, false, nullptr);
+	if (!stop.Valid())
+		throw "Failed to create event";
 
 	hr = SpFindBestToken(SPCAT_RECOGNIZERS, lang_str, nullptr, &token);
 	if (FAILED(hr))
@@ -79,12 +50,10 @@ try {
 		throw HRError("CreateRecoContext failed", hr);
 
 	ULONGLONG interest = SPFEI(SPEI_RECOGNITION) |
-		SPFEI(SPEI_END_SR_STREAM);
+	                     SPFEI(SPEI_END_SR_STREAM);
 	hr = context->SetInterest(interest, interest);
 	if (FAILED(hr))
 		throw HRError("SetInterest failed", hr);
-
-	HANDLE notify;
 
 	hr = context->SetNotifyWin32Event();
 	if (FAILED(hr))
@@ -95,7 +64,7 @@ try {
 		throw HRError("GetNotifyEventHandle failed", E_NOINTERFACE);
 
 	size_t sample_rate = audio_output_get_sample_rate(obs_get_audio());
-	audio = new CaptionStream((DWORD)sample_rate);
+	audio = new CaptionStream((DWORD)sample_rate, this);
 	audio->Release();
 
 	hr = recognizer->SetInput(audio, false);
@@ -110,6 +79,35 @@ try {
 	if (FAILED(hr))
 		throw HRError("LoadDictation failed", hr);
 
+	try {
+		t = std::thread([this] () {main_thread();});
+	} catch (...) {
+		throw "Failed to create thread";
+	}
+
+} catch (const char *err) {
+	blog(LOG_WARNING, "%s: %s", __FUNCTION__, err);
+	throw CAPTIONS_ERROR_GENERIC_FAIL;
+
+} catch (HRError err) {
+	blog(LOG_WARNING, "%s: %s (%lX)", __FUNCTION__, err.str, err.hr);
+	throw CAPTIONS_ERROR_GENERIC_FAIL;
+}
+
+mssapi_captions::~mssapi_captions()
+{
+	if (t.joinable()) {
+		SetEvent(stop);
+		t.join();
+	}
+}
+
+void mssapi_captions::main_thread()
+try {
+	HRESULT hr;
+
+	os_set_thread_name(__FUNCTION__);
+
 	hr = grammar->SetDictationState(SPRS_ACTIVE);
 	if (FAILED(hr))
 		throw HRError("SetDictationState failed", hr);
@@ -118,14 +116,9 @@ try {
 	if (FAILED(hr))
 		throw HRError("SetRecoState(SPRST_ACTIVE) failed", hr);
 
-	HANDLE events[] = {notify, stop_event};
+	HANDLE events[] = {notify, stop};
 
-	{
-		OBSSource strong = OBSGetStrongRef(source);
-		if (strong)
-			obs_source_add_audio_capture_callback(strong,
-					pre_cb, &cb);
-	}
+	started = true;
 
 	for (;;) {
 		DWORD ret = WaitForMultipleObjects(2, events, false, INFINITE);
@@ -148,15 +141,9 @@ try {
 				char text_utf8[512];
 				os_wcs_to_utf8(text, 0, text_utf8, 512);
 
-				obs_output_t *output =
-					obs_frontend_get_streaming_output();
-				if (output)
-					obs_output_output_caption_text1(output,
-							text_utf8);
+				callback(text_utf8);
 
 				blog(LOG_DEBUG, "\"%s\"", text_utf8);
-
-				obs_output_release(output);
 
 			} else if (event.eEventId == SPEI_END_SR_STREAM) {
 				exit = true;
@@ -168,18 +155,25 @@ try {
 			break;
 	}
 
-	{
-		OBSSource strong = OBSGetStrongRef(source);
-		if (strong)
-			obs_source_remove_audio_capture_callback(strong,
-					pre_cb, &cb);
-	}
-
 	audio->Stop();
-
-	CoUninitialize();
 
 } catch (HRError err) {
 	blog(LOG_WARNING, "%s failed: %s (%lX)", __FUNCTION__, err.str, err.hr);
-	CoUninitialize();
 }
+
+void mssapi_captions::pcm_data(const void *data, size_t frames)
+{
+	if (started)
+		audio->PushAudio(data, frames);
+}
+
+captions_handler_info mssapi_info = {
+	[] () -> std::string
+	{
+		return "Microsoft Speech-to-Text";
+	},
+	[] (captions_cb cb, const std::string &lang) -> captions_handler *
+	{
+		return new mssapi_captions(cb, lang);
+	}
+};
